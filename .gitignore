@@ -1,8 +1,0 @@
-.DS_Store
-Thumbs.db
-__pycache__
-*.pyc
-*.pyo
-.idea/
-.vscode/
-RMT Markers_to_render_queue_settings/
