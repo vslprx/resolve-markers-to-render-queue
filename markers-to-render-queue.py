@@ -1317,14 +1317,28 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                         t = clip_info['track']
                         clips_by_track.setdefault(t, []).append(clip_info)
 
-                    # Process tracks top-to-bottom: add jobs for a track, then disable it
-                    # so DaVinci won't include it when rendering lower tracks
-                    tracks_sorted_top_down = sorted(clips_by_track.keys(), reverse=True)
-                    disabled_tracks = []
+                    # Process tracks bottom-to-top so suffix numbers are logical
+                    # (Track 1 → _001/_002, Track 2 → _003/_004, etc.)
+                    # For each track: disable all others → render → restore all others
+                    tracks_sorted_bottom_up = sorted(clips_by_track.keys())
+                    total_video_tracks = tl.GetTrackCount("video")
                     global_clip_idx = 0
 
-                    for track_num in tracks_sorted_top_down:
+                    for track_num in tracks_sorted_bottom_up:
                         track_clips = clips_by_track[track_num]
+
+                        # Disable every track except the current one
+                        tracks_to_restore = []
+                        try:
+                            resolve.OpenPage("edit")
+                            time.sleep(0.2)
+                            for t in range(1, total_video_tracks + 1):
+                                if t != track_num:
+                                    tl.SetTrackEnable("video", t, False)
+                                    tracks_to_restore.append(t)
+                                    print(f"Disabled track {t} (rendering track {track_num})")
+                        except Exception as e:
+                            debug_print(f"Error disabling tracks: {e}")
 
                         for clip_info in track_clips:
                             global_clip_idx += 1
@@ -1358,7 +1372,6 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                 proj.SetRenderSettings(render_settings)
                                 proj.AddRenderJob()
 
-                                # Find the newly added job
                                 jobs_after = proj.GetRenderJobList() or []
                                 new_job = next((j for j in jobs_after if j['JobId'] not in jobs_before), None)
 
@@ -1383,28 +1396,15 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                 update_status(error_msg)
                                 print(error_msg)
 
-                        # After all clips on this track are rendered, disable it so
-                        # lower tracks won't be occluded in subsequent renders.
-                        # Skip the last (bottom) track — no tracks below it remain.
-                        if track_num != tracks_sorted_top_down[-1]:
-                            try:
-                                resolve.OpenPage("edit")
-                                time.sleep(0.2)
-                                tl.SetTrackEnable("video", track_num, False)
-                                disabled_tracks.append(track_num)
-                                print(f"Disabled track {track_num} after rendering")
-                            except Exception as e:
-                                debug_print(f"Could not disable track {track_num}: {e}")
-
-                    # Restore all disabled tracks
-                    try:
-                        resolve.OpenPage("edit")
-                        time.sleep(0.2)
-                        for track_num in disabled_tracks:
-                            tl.SetTrackEnable("video", track_num, True)
-                            debug_print(f"Restored track {track_num}")
-                    except Exception as e:
-                        debug_print(f"Error restoring tracks: {e}")
+                        # Restore all tracks disabled for this pass
+                        try:
+                            resolve.OpenPage("edit")
+                            time.sleep(0.2)
+                            for t in tracks_to_restore:
+                                tl.SetTrackEnable("video", t, True)
+                                debug_print(f"Restored track {t}")
+                        except Exception as e:
+                            debug_print(f"Error restoring tracks: {e}")
                 else:
                     print(f"No {media_type} clips found at marker frame {marker_frame}")
             else:
