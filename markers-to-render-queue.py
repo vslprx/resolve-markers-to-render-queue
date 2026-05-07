@@ -1356,15 +1356,16 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                             }
 
                             if not itm["use_preset_naming"].Checked and filename:
-                                counter_suffix = f"_{global_clip_idx:03d}"
                                 custom_name = filename
-                                if custom_name.endswith('.'):
-                                    custom_name = custom_name[:-1] + counter_suffix + '.'
-                                elif '.' in custom_name:
-                                    parts = custom_name.rsplit('.', 1)
-                                    custom_name = parts[0] + counter_suffix + '.' + parts[1]
-                                else:
-                                    custom_name = custom_name + counter_suffix
+                                if len(all_clips) > 1:
+                                    counter_suffix = f"_{global_clip_idx:03d}"
+                                    if custom_name.endswith('.'):
+                                        custom_name = custom_name[:-1] + counter_suffix + '.'
+                                    elif '.' in custom_name:
+                                        parts = custom_name.rsplit('.', 1)
+                                        custom_name = parts[0] + counter_suffix + '.' + parts[1]
+                                    else:
+                                        custom_name = custom_name + counter_suffix
                                 render_settings["CustomName"] = custom_name
 
                             try:
