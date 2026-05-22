@@ -1233,11 +1233,6 @@ def preset_lst(proj):
 
 
 def export_stills(proj, tl, markers, all_markers, path, filenames):
-    global _cancel_render
-    _cancel_render = False
-    itm["Export"].Enabled = False
-    itm["StopRender"].Enabled = True
-
     proj.SetCurrentTimeline(tl)
     print("Timeline set.")
 
@@ -1251,8 +1246,6 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
 
     if not (has_video or has_audio):
         update_status("No media clips found to export")
-        itm["Export"].Enabled = True
-        itm["StopRender"].Enabled = False
         return
 
     media_type = "video" if has_video else "audio"
@@ -1546,9 +1539,6 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
     update_status(status_message)
     print(status_message)
 
-    itm["Export"].Enabled = True
-    itm["StopRender"].Enabled = False
-
 
 ################################################################################################
 # MAIN EXECUTION
@@ -1561,14 +1551,25 @@ def _main(ev):
     Args:
         ev: The event object triggering this function.
     """
-    projectManager = resolve.GetProjectManager()
-    project = projectManager.GetCurrentProject()
-    timeline = project.GetTimelineByIndex(tl_idx(project, itm["tl_preset"].CurrentText))
+    global _cancel_render
+    _cancel_render = False
+    itm["Export"].Enabled = False
+    itm["StopRender"].Enabled = True
+    try:
+        projectManager = resolve.GetProjectManager()
+        project = projectManager.GetCurrentProject()
+        timeline = project.GetTimelineByIndex(tl_idx(project, itm["tl_preset"].CurrentText))
 
-    markers, all_markers = get_markers(timeline)
-    path = itm["export_path"].CurrentText
-    filename_map = get_filenames(markers, all_markers)
-    export_stills(project, timeline, markers, all_markers, path, filename_map)
+        markers, all_markers = get_markers(timeline)
+        path = itm["export_path"].CurrentText
+        filename_map = get_filenames(markers, all_markers)
+        export_stills(project, timeline, markers, all_markers, path, filename_map)
+    except Exception as e:
+        update_status(f"Export error: {str(e)}")
+        print(f"Export error: {str(e)}")
+    finally:
+        itm["Export"].Enabled = True
+        itm["StopRender"].Enabled = False
 
 ################################################################################################
 # UI EVENT HANDLERS
