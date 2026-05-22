@@ -36,7 +36,6 @@ import os
 import json
 import time
 import re
-import threading
 
 
 ################################################################################################
@@ -537,7 +536,8 @@ def main_ui():
                 "Weight": 1
             })
         ])
-    ])
+    ]),
+    ui.Timer({'ID': 'RenderTimer', 'Interval': 200})
 
 def sanitize_filename(s):
     """
@@ -1234,6 +1234,257 @@ def preset_lst(proj):
 
 
 
+################################################################################################
+# TIMER-BASED RENDER PIPELINE
+# All Resolve API calls happen on the main thread (timer callbacks run on the main thread),
+# so the UI stays responsive and the Stop button works between render operations.
+################################################################################################
+
+_rs = {          # render state — mutated by _main and _render_timer_step
+    'active': False,
+    'proj': None,
+    'tl': None,
+    'ops': [],
+    'op_idx': 0,
+    'tracks_to_restore': [],
+    'queued_clips': [],
+    'media_type': 'video',
+}
+
+
+def _collect_render_ops(proj, tl, markers, all_markers, path, filenames):
+    """
+    Converts marker/clip data into a flat list of render operations.
+    Nothing is rendered here — ops are executed one-per-timer-tick later.
+    Returns (ops, media_type).
+    """
+    ops = []
+    render_all_tracks = itm["render_all_tracks"].Checked
+    use_preset_naming = itm["use_preset_naming"].Checked
+    start_frame = tl.GetStartFrame()
+    queued_set = set()
+
+    has_video, has_audio, _, _ = analyze_timeline_tracks(tl, 0)
+    if not (has_video or has_audio):
+        return ops, 'video'
+    media_type = "video" if has_video else "audio"
+    total_video_tracks = tl.GetTrackCount("video") if has_video else 0
+
+    for mark in sorted(markers):
+        marker_data = all_markers.get(mark, {})
+        marker_type_str = get_marker_type(marker_data)
+        marker_frame = start_frame + mark
+        filename = filenames.get(mark, "")
+
+        if marker_type_str == "duration":
+            in_pt = start_frame + mark
+            out_pt = start_frame + mark + marker_data['duration'] - 1
+            v_in, v_out = validate_frame_range(in_pt, out_pt, tl)
+            if v_in is None:
+                print(f"Skipping duration marker {mark}: invalid range")
+                continue
+            folder_hint = {'marker_frame': mark, 'timeline_start': v_in, 'timeline_end': v_out}
+            target_dir = create_render_folder_path(path, filename, folder_hint, all_markers)
+            rs = {"MarkIn": v_in, "MarkOut": v_out, "TargetDir": target_dir}
+            if not use_preset_naming and filename:
+                rs["CustomName"] = filename
+            clip_id = (v_in, v_out, 0)
+            if clip_id not in queued_set:
+                ops.append({'tracks_to_disable': [], 'render_settings': rs,
+                            'start_rendering': False,
+                            'timeline_start': v_in, 'timeline_end': v_out,
+                            'track_num': 0, 'media_type': media_type})
+                queued_set.add(clip_id)
+
+        else:  # single marker
+            if render_all_tracks:
+                sorted_all = sorted(all_markers.keys())
+                idx = sorted_all.index(mark) if mark in sorted_all else -1
+                next_mf = (start_frame + sorted_all[idx + 1]) if idx >= 0 and idx + 1 < len(sorted_all) else None
+
+                all_clips = get_all_clips_at_marker(tl, marker_frame, next_mf)
+                if not all_clips:
+                    continue
+
+                clips_by_track = {}
+                for ci in all_clips:
+                    clips_by_track.setdefault(ci['track'], []).append(ci)
+
+                folder_hint = {'marker_frame': mark,
+                               'timeline_start': min(ci['timeline_start'] for ci in all_clips),
+                               'timeline_end': max(ci['timeline_end'] for ci in all_clips)}
+                target_dir = create_render_folder_path(path, filename, folder_hint, all_markers)
+
+                global_idx = 0
+                for track_num in sorted(clips_by_track.keys()):
+                    disable = [t for t in range(1, total_video_tracks + 1) if t != track_num]
+                    for ci in clips_by_track[track_num]:
+                        global_idx += 1
+                        mark_out = min(ci['timeline_end'], next_mf - 1) if next_mf else ci['timeline_end']
+                        rs = {"MarkIn": ci['timeline_start'], "MarkOut": mark_out, "TargetDir": target_dir}
+                        if not use_preset_naming and filename:
+                            custom = filename
+                            if len(all_clips) > 1:
+                                sfx = f"_{global_idx:03d}"
+                                if custom.endswith('.'):
+                                    custom = custom[:-1] + sfx + '.'
+                                elif '.' in custom:
+                                    p = custom.rsplit('.', 1)
+                                    custom = p[0] + sfx + '.' + p[1]
+                                else:
+                                    custom = custom + sfx
+                            rs["CustomName"] = custom
+                        clip_id = (ci['timeline_start'], mark_out, track_num)
+                        if clip_id not in queued_set:
+                            ops.append({'tracks_to_disable': disable, 'render_settings': rs,
+                                        'start_rendering': True,
+                                        'timeline_start': ci['timeline_start'], 'timeline_end': mark_out,
+                                        'track_num': track_num, 'media_type': media_type})
+                            queued_set.add(clip_id)
+            else:
+                clip_info = get_clip_at_marker(tl, marker_frame)
+                if not clip_info:
+                    continue
+                clip_info['marker_frame'] = mark
+                target_dir = create_render_folder_path(path, filename, clip_info, all_markers)
+                rs = {"MarkIn": clip_info['timeline_start'], "MarkOut": clip_info['timeline_end'],
+                      "TargetDir": target_dir}
+                if not use_preset_naming and filename:
+                    rs["CustomName"] = filename
+                clip_id = (clip_info['timeline_start'], clip_info['timeline_end'], clip_info['track'])
+                if clip_id not in queued_set:
+                    ops.append({'tracks_to_disable': [], 'render_settings': rs,
+                                'start_rendering': False,
+                                'timeline_start': clip_info['timeline_start'],
+                                'timeline_end': clip_info['timeline_end'],
+                                'track_num': clip_info['track'], 'media_type': media_type})
+                    queued_set.add(clip_id)
+
+    return ops, media_type
+
+
+def _render_timer_step(ev=None):
+    """
+    Called every 200 ms by RenderTimer (on the main thread).
+    Processes one render operation per firing — no blocking, no threading needed.
+    """
+    global _rs, _cancel_render
+
+    if not _rs['active']:
+        return
+
+    proj = _rs['proj']
+    tl   = _rs['tl']
+
+    # Handle Stop button
+    if _cancel_render:
+        if proj.IsRenderingInProgress():
+            proj.StopRendering()
+        _restore_tracks(tl)
+        _finish_render(cancelled=True)
+        return
+
+    # Wait while a render_all_tracks job is in progress
+    if proj.IsRenderingInProgress():
+        return
+
+    # After a render_all_tracks job finishes: restore disabled tracks
+    _restore_tracks(tl)
+
+    # All ops done?
+    if _rs['op_idx'] >= len(_rs['ops']):
+        _finish_render(cancelled=False)
+        return
+
+    # Execute next op
+    op = _rs['ops'][_rs['op_idx']]
+    _rs['op_idx'] += 1
+
+    # Disable tracks for isolation (render_all_tracks mode)
+    if op['tracks_to_disable']:
+        try:
+            resolve.OpenPage("edit")
+            for t in op['tracks_to_disable']:
+                tl.SetTrackEnable("video", t, False)
+            _rs['tracks_to_restore'] = op['tracks_to_disable']
+        except Exception as e:
+            debug_print(f"Error disabling tracks: {e}")
+
+    # Add render job
+    try:
+        jobs_before = set(j['JobId'] for j in proj.GetRenderJobList() or [])
+        proj.SetRenderSettings(op['render_settings'])
+        proj.AddRenderJob()
+
+        jobs_after = proj.GetRenderJobList() or []
+        new_job = next((j for j in jobs_after if j['JobId'] not in jobs_before), None)
+
+        if new_job:
+            update_status(f"Added job: frames {op['timeline_start']}–{op['timeline_end']} "
+                          f"({_rs['op_idx']}/{len(_rs['ops'])})")
+            print(f"Render job added: {op['timeline_start']}-{op['timeline_end']}, "
+                  f"track {op['track_num']}")
+
+            if op['start_rendering']:
+                proj.StartRendering([new_job['JobId']])
+
+            _rs['queued_clips'].append({
+                'job_id': new_job['JobId'],
+                'timeline_start': op['timeline_start'],
+                'timeline_end':   op['timeline_end'],
+                'media_type':     op['media_type'],
+            })
+        else:
+            print(f"Warning: AddRenderJob produced no new job for op {_rs['op_idx']}")
+
+    except Exception as e:
+        update_status(f"Render op error: {str(e)}")
+        print(f"Render op error: {str(e)}")
+
+
+def _restore_tracks(tl):
+    """Restores previously disabled video tracks."""
+    global _rs
+    if not _rs['tracks_to_restore']:
+        return
+    try:
+        resolve.OpenPage("edit")
+        for t in _rs['tracks_to_restore']:
+            tl.SetTrackEnable("video", t, True)
+            debug_print(f"Restored track {t}")
+    except Exception as e:
+        debug_print(f"Error restoring tracks: {e}")
+    _rs['tracks_to_restore'] = []
+
+
+def _finish_render(cancelled=False):
+    """Stops the timer and restores UI state."""
+    global _rs, _cancel_render
+    _rs['active'] = False
+    itm['RenderTimer'].Stop()
+    _cancel_render = False
+
+    if itm["render_all_tracks"].Checked:
+        try:
+            resolve.OpenPage("deliver")
+        except Exception as e:
+            debug_print(f"Could not switch to Deliver page: {e}")
+
+    if cancelled:
+        msg = f"Render cancelled. Jobs added: {len(_rs['queued_clips'])}"
+    else:
+        msg = f"Done. {_rs['media_type']} jobs added: {len(_rs['queued_clips'])}"
+    update_status(msg)
+    print(msg)
+
+    itm["Export"].Enabled = True
+    itm["StopRender"].Enabled = False
+
+
+################################################################################################
+# LEGACY STUB (kept so existing call sites compile; replaced by timer pipeline above)
+################################################################################################
+
 def export_stills(proj, tl, markers, all_markers, path, filenames):
     proj.SetCurrentTimeline(tl)
     print("Timeline set.")
@@ -1514,90 +1765,65 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                 else:
                     print(f"No {media_type} clip found at marker frame {marker_frame}")
 
-    final_jobs = proj.GetRenderJobList() or []
-    new_job_ids = set(job['JobId'] for job in final_jobs) - initial_jobs
-
-    for clip_info in queued_clips:
-        for job in final_jobs:
-            if job['JobId'] in new_job_ids:
-                if job['MarkIn'] == clip_info['timeline_start'] and job['MarkOut'] == clip_info['timeline_end']:
-                    clip_info['job_id'] = job['JobId']
-                    clip_info['render_name'] = job['OutputFilename']
-
-    # Return to Deliver page so user can see the populated render queue
-    if _render_context.get('render_all_tracks', itm["render_all_tracks"].Checked):
-        try:
-            resolve.OpenPage("deliver")
-            print("Switched back to Deliver page.")
-        except Exception as e:
-            debug_print(f"Could not switch to Deliver page: {e}")
-
-    if _cancel_render:
-        status_message = f"Render cancelled. Clips processed before stop: {len(queued_clips)}"
-    else:
-        status_message = f"Render queue setup complete. Total {media_type} clips queued: {len(queued_clips)}"
-    update_status(status_message)
-    print(status_message)
-
-
 ################################################################################################
 # MAIN EXECUTION
 ################################################################################################
 
 def _main(ev):
     """
-    Main execution function for rendering. Processes markers and adds clips to the render queue.
-
-    Args:
-        ev: The event object triggering this function.
+    Collects all render operations synchronously, then hands them to the
+    timer-based pipeline so the UI stays responsive during rendering.
     """
-    global _cancel_render, _render_context
+    global _cancel_render, _rs
+
+    if _rs['active']:
+        update_status("Render already in progress")
+        return
+
     _cancel_render = False
 
-    # ── Snapshot ALL UI state on the main thread ──────────────────────────
-    # Resolve API and UI elements are not safe to access from a background
-    # thread, so we read everything here and pass it to the worker.
-    _render_context = {
-        'render_all_tracks':  itm["render_all_tracks"].Checked,
-        'use_preset_naming':  itm["use_preset_naming"].Checked,
-        'create_folders':     itm["create_folders"].Checked,
-        'video_track':        itm["video_track"].CurrentText,
-        'render_preset':      itm["render_preset"].CurrentText,
-    }
-    tl_name = itm["tl_preset"].CurrentText
-    path    = itm["export_path"].CurrentText
-
-    # ── Main-thread Resolve calls (API must run on the main thread) ───────
     try:
         pm   = resolve.GetProjectManager()
         proj = pm.GetCurrentProject()
-        tl   = proj.GetTimelineByIndex(tl_idx(proj, tl_name))
+        tl   = proj.GetTimelineByIndex(tl_idx(proj, itm["tl_preset"].CurrentText))
+
+        proj.SetCurrentTimeline(tl)
+        proj.LoadRenderPreset(itm["render_preset"].CurrentText)
+
         markers, all_markers = get_markers(tl)
+        if not markers:
+            update_status("No matching markers found")
+            return
+
+        path         = itm["export_path"].CurrentText
         filename_map = get_filenames(markers, all_markers)
+        ops, mtype   = _collect_render_ops(proj, tl, markers, all_markers, path, filename_map)
+
+        if not ops:
+            update_status("No clips found at marker positions")
+            return
+
+        _rs.update({
+            'active':            True,
+            'proj':              proj,
+            'tl':                tl,
+            'ops':               ops,
+            'op_idx':            0,
+            'tracks_to_restore': [],
+            'queued_clips':      [],
+            'media_type':        mtype,
+        })
+
+        itm["Export"].Enabled    = False
+        itm["StopRender"].Enabled = True
+        update_status(f"Starting: {len(ops)} render operation(s) queued")
+        itm['RenderTimer'].Start()
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         update_status(f"Export error: {str(e)}")
         print(f"Export error: {str(e)}")
-        return
-
-    itm["Export"].Enabled = False
-    itm["StopRender"].Enabled = True
-
-    # ── Background thread: only the blocking render loop ──────────────────
-    def _run():
-        try:
-            export_stills(proj, tl, markers, all_markers, path, filename_map)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            update_status(f"Export error: {str(e)}")
-            print(f"Export error: {str(e)}")
-        finally:
-            itm["Export"].Enabled = True
-            itm["StopRender"].Enabled = False
-
-    threading.Thread(target=_run, daemon=True).start()
 
 ################################################################################################
 # UI EVENT HANDLERS
@@ -2213,6 +2439,7 @@ window.On.render_all_tracks.Clicked = populate_markers_table
 window.On["export_path"].TextChanged = update_export_button_state
 window.On.Export.Clicked = _main
 window.On.StopRender.Clicked = _stop_render
+window.On.RenderTimer.Timeout = _render_timer_step
 window.On.export_location.Clicked = _file_browser
 window.On.MTRWin.Close = _close
 window.On["markers_table"].ItemDoubleClicked = on_marker_double_clicked
