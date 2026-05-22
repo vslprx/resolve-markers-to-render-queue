@@ -36,6 +36,7 @@ import os
 import json
 import time
 import re
+import threading
 
 
 ################################################################################################
@@ -1553,23 +1554,29 @@ def _main(ev):
     _cancel_render = False
     itm["Export"].Enabled = False
     itm["StopRender"].Enabled = True
-    try:
-        projectManager = resolve.GetProjectManager()
-        project = projectManager.GetCurrentProject()
-        timeline = project.GetTimelineByIndex(tl_idx(project, itm["tl_preset"].CurrentText))
 
-        markers, all_markers = get_markers(timeline)
-        path = itm["export_path"].CurrentText
-        filename_map = get_filenames(markers, all_markers)
-        export_stills(project, timeline, markers, all_markers, path, filename_map)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        update_status(f"Export error: {str(e)}")
-        print(f"Export error: {str(e)}")
-    finally:
-        itm["Export"].Enabled = True
-        itm["StopRender"].Enabled = False
+    # Snapshot UI values on the main thread before handing off
+    tl_name = itm["tl_preset"].CurrentText
+    path = itm["export_path"].CurrentText
+
+    def _run():
+        try:
+            pm = resolve.GetProjectManager()
+            proj = pm.GetCurrentProject()
+            tl = proj.GetTimelineByIndex(tl_idx(proj, tl_name))
+            markers, all_markers = get_markers(tl)
+            filename_map = get_filenames(markers, all_markers)
+            export_stills(proj, tl, markers, all_markers, path, filename_map)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            update_status(f"Export error: {str(e)}")
+            print(f"Export error: {str(e)}")
+        finally:
+            itm["Export"].Enabled = True
+            itm["StopRender"].Enabled = False
+
+    threading.Thread(target=_run, daemon=True).start()
 
 ################################################################################################
 # UI EVENT HANDLERS
