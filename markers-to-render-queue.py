@@ -1335,11 +1335,14 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
             render_all_tracks = itm["render_all_tracks"].Checked
 
             if render_all_tracks:
-                # Find next marker to define search boundary
-                sorted_markers = sorted(markers)
-                current_idx = sorted_markers.index(mark)
-                next_marker = sorted_markers[current_idx + 1] if current_idx + 1 < len(sorted_markers) else None
-                next_marker_frame = (start_frame + next_marker) if next_marker is not None else None
+                # Use ALL timeline markers (not just filtered) for zone boundary —
+                # must match populate_markers_table which also uses all markers
+                sorted_all_marker_frames = sorted(all_markers.keys())
+                current_idx_all = sorted_all_marker_frames.index(mark) if mark in sorted_all_marker_frames else -1
+                if current_idx_all >= 0 and current_idx_all + 1 < len(sorted_all_marker_frames):
+                    next_marker_frame = start_frame + sorted_all_marker_frames[current_idx_all + 1]
+                else:
+                    next_marker_frame = None
 
                 # Get all clips from all video tracks
                 all_clips = get_all_clips_at_marker(tl, marker_frame, next_marker_frame)
