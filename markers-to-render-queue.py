@@ -47,6 +47,7 @@ ui = fu.UIManager
 disp = bmd.UIDispatcher(ui)
 
 DEBUG_MODE = False
+_cancel_render = False
 # List of available marker colors
 color_lst = [
     'All', 'Blue', 'Cyan', 'Green', 'Yellow', 'Red', 'Pink', 'Purple',
@@ -210,6 +211,28 @@ PRIMARY_ACTION_BUTTON_STYLE = """
         border: 2px solid #8c2f39;
         background-color: rgb(50,50,50);
         color: rgb(150, 150, 150);
+    }
+"""
+STOP_BUTTON_STYLE = """
+    QPushButton {
+        border: 1px solid #8c2f39;
+        max-height: 28px;
+        border-radius: 14px;
+        background-color: #8c2f39;
+        color: #FFFFFF;
+        min-height: 28px;
+        font-size: 13px;
+    }
+    QPushButton:hover {
+        background-color: #b03a46;
+    }
+    QPushButton:pressed {
+        background-color: #c0505e;
+    }
+    QPushButton:disabled {
+        border: 1px solid #555;
+        background-color: rgb(50,50,50);
+        color: rgb(100, 100, 100);
     }
 """
 DIVIDER_CSS = """
@@ -496,12 +519,22 @@ def main_ui():
 
         ]),
         ui.Label({"ID": "naming_format", "Text": "Format: showID_episode_shotID_task_version"}),
-        ui.Button({
-            "ID": "Export",
-            "Text": "Add to Render Queue",
-            "StyleSheet": PRIMARY_ACTION_BUTTON_STYLE,
-            "Enabled": True
-        })
+        ui.HGroup({"Spacing": 5}, [
+            ui.Button({
+                "ID": "Export",
+                "Text": "Add to Render Queue",
+                "StyleSheet": PRIMARY_ACTION_BUTTON_STYLE,
+                "Enabled": True,
+                "Weight": 3
+            }),
+            ui.Button({
+                "ID": "StopRender",
+                "Text": "Stop Render",
+                "StyleSheet": STOP_BUTTON_STYLE,
+                "Enabled": False,
+                "Weight": 1
+            })
+        ])
     ])
 
 def sanitize_filename(s):
@@ -1200,6 +1233,10 @@ def preset_lst(proj):
 
 
 def export_stills(proj, tl, markers, all_markers, path, filenames):
+    global _cancel_render
+    _cancel_render = False
+    itm["Export"].Enabled = False
+    itm["StopRender"].Enabled = True
 
     proj.SetCurrentTimeline(tl)
     print("Timeline set.")
@@ -1214,6 +1251,8 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
 
     if not (has_video or has_audio):
         update_status("No media clips found to export")
+        itm["Export"].Enabled = True
+        itm["StopRender"].Enabled = False
         return
 
     media_type = "video" if has_video else "audio"
@@ -1228,6 +1267,12 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
     print(f"Processing {media_type} clips under markers...")
 
     for mark in sorted(markers):
+        disp.ProcessEvents()
+        if _cancel_render:
+            update_status("Render cancelled by user.")
+            print("Render cancelled by user.")
+            break
+
         marker_frame = start_frame + mark
         marker_data = all_markers.get(mark, {})
         marker_type = get_marker_type(marker_data)
@@ -1341,6 +1386,9 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                             debug_print(f"Error disabling tracks: {e}")
 
                         for clip_info in track_clips:
+                            if _cancel_render:
+                                break
+
                             global_clip_idx += 1
                             clip_info['marker_frame'] = mark
 
@@ -1349,9 +1397,15 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                 print(f"Clip on track {track_num} already queued.")
                                 continue
 
+                            # Clamp MarkOut to next marker boundary so clips that extend
+                            # past the next marker are not rendered beyond it
+                            mark_out = clip_info['timeline_end']
+                            if next_marker_frame is not None:
+                                mark_out = min(mark_out, next_marker_frame - 1)
+
                             render_settings = {
                                 "MarkIn": clip_info['timeline_start'],
-                                "MarkOut": clip_info['timeline_end'],
+                                "MarkOut": mark_out,
                                 "TargetDir": target_dir
                             }
 
@@ -1377,11 +1431,16 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                 new_job = next((j for j in jobs_after if j['JobId'] not in jobs_before), None)
 
                                 if new_job:
-                                    update_status(f"Rendering track {track_num}: frames {clip_info['timeline_start']}-{clip_info['timeline_end']}")
-                                    print(f"Rendering track {track_num}: frames {clip_info['timeline_start']}-{clip_info['timeline_end']}")
+                                    update_status(f"Rendering track {track_num}: frames {clip_info['timeline_start']}-{mark_out}")
+                                    print(f"Rendering track {track_num}: frames {clip_info['timeline_start']}-{mark_out}")
                                     proj.StartRendering([new_job['JobId']])
                                     while proj.IsRenderingInProgress():
-                                        time.sleep(0.5)
+                                        disp.ProcessEvents()
+                                        if _cancel_render:
+                                            proj.StopRendering()
+                                            print(f"Render stopped by user on track {track_num}")
+                                            break
+                                        time.sleep(0.1)
                                     print(f"Done rendering track {track_num}")
 
                                     clip_info.update({
@@ -1477,9 +1536,15 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
         except Exception as e:
             debug_print(f"Could not switch to Deliver page: {e}")
 
-    status_message = f"Render queue setup complete. Total {media_type} clips queued: {len(queued_clips)}"
+    if _cancel_render:
+        status_message = f"Render cancelled. Clips processed before stop: {len(queued_clips)}"
+    else:
+        status_message = f"Render queue setup complete. Total {media_type} clips queued: {len(queued_clips)}"
     update_status(status_message)
     print(status_message)
+
+    itm["Export"].Enabled = True
+    itm["StopRender"].Enabled = False
 
 
 ################################################################################################
@@ -1697,6 +1762,12 @@ def apply_settings_to_ui(settings):
         itm["version_prefix"].Text = settings["version"]["prefix"]
         itm["version_start"].Value = settings["version"]["start"]
         itm["version_padding"].Value = settings["version"]["padding"]
+
+def _stop_render(ev):
+    global _cancel_render
+    _cancel_render = True
+    itm["StopRender"].Enabled = False
+    update_status("Stop requested — finishing current clip...")
 
 def _close(ev):
     """
@@ -2109,6 +2180,7 @@ window.On.render_all_tracks.Clicked = populate_markers_table
 # Set up event handlers
 window.On["export_path"].TextChanged = update_export_button_state
 window.On.Export.Clicked = _main
+window.On.StopRender.Clicked = _stop_render
 window.On.export_location.Clicked = _file_browser
 window.On.MTRWin.Close = _close
 window.On["markers_table"].ItemDoubleClicked = on_marker_double_clicked
