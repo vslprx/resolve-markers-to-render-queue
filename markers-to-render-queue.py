@@ -1260,7 +1260,6 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
     print(f"Processing {media_type} clips under markers...")
 
     for mark in sorted(markers):
-        disp.ProcessEvents()
         if _cancel_render:
             update_status("Render cancelled by user.")
             print("Render cancelled by user.")
@@ -1431,7 +1430,6 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                     print(f"Rendering track {track_num}: frames {clip_info['timeline_start']}-{mark_out}")
                                     proj.StartRendering([new_job['JobId']])
                                     while proj.IsRenderingInProgress():
-                                        disp.ProcessEvents()
                                         if _cancel_render:
                                             proj.StopRendering()
                                             print(f"Render stopped by user on track {track_num}")
@@ -1565,6 +1563,8 @@ def _main(ev):
         filename_map = get_filenames(markers, all_markers)
         export_stills(project, timeline, markers, all_markers, path, filename_map)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         update_status(f"Export error: {str(e)}")
         print(f"Export error: {str(e)}")
     finally:
