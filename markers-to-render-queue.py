@@ -49,6 +49,7 @@ disp = bmd.UIDispatcher(ui)
 
 DEBUG_MODE = False
 _cancel_render = False
+_render_context = {}   # UI snapshot passed to the background render thread
 # List of available marker colors
 color_lst = [
     'All', 'Blue', 'Cyan', 'Green', 'Yellow', 'Red', 'Pink', 'Purple',
@@ -992,7 +993,7 @@ def get_clip_at_marker(timeline, marker_frame):
     has_video, has_audio, video_tracks, audio_tracks = analyze_timeline_tracks(timeline, marker_frame)
 
     if has_video:
-        selected_track = itm["video_track"].CurrentText
+        selected_track = _render_context.get('video_track', itm["video_track"].CurrentText)
         video_track_count = timeline.GetTrackCount("video")
 
         if selected_track != "Default (Topmost)":
@@ -1106,7 +1107,7 @@ def create_render_folder_path(base_path, filename, clip_info=None, all_markers=N
     Returns:
         str: Full path to the render folder
     """
-    if not itm["create_folders"].Checked:
+    if not _render_context.get('create_folders', itm["create_folders"].Checked):
         return base_path
 
     try:
@@ -1238,7 +1239,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
     print("Timeline set.")
 
     print("Loading render preset...")
-    proj.LoadRenderPreset(itm["render_preset"].CurrentText)
+    proj.LoadRenderPreset(_render_context.get('render_preset', itm["render_preset"].CurrentText))
     print("Render preset loaded.")
 
 
@@ -1299,7 +1300,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                 "TargetDir": target_dir
             }
 
-            if not itm["use_preset_naming"].Checked and filename:
+            if not _render_context.get('use_preset_naming', itm["use_preset_naming"].Checked) and filename:
                 render_settings["CustomName"] = filename
 
             try:
@@ -1325,7 +1326,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                 print(error_msg)
         else:
             # Handle single markers
-            render_all_tracks = itm["render_all_tracks"].Checked
+            render_all_tracks = _render_context.get('render_all_tracks', itm["render_all_tracks"].Checked)
 
             if render_all_tracks:
                 # Use ALL timeline markers (not just filtered) for zone boundary —
@@ -1405,7 +1406,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                                 "TargetDir": target_dir
                             }
 
-                            if not itm["use_preset_naming"].Checked and filename:
+                            if not _render_context.get('use_preset_naming', itm["use_preset_naming"].Checked) and filename:
                                 custom_name = filename
                                 if len(all_clips) > 1:
                                     counter_suffix = f"_{global_clip_idx:03d}"
@@ -1487,7 +1488,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                             "TargetDir": target_dir
                         }
 
-                        if not itm["use_preset_naming"].Checked and filename:
+                        if not _render_context.get('use_preset_naming', itm["use_preset_naming"].Checked) and filename:
                             render_settings["CustomName"] = filename
 
                         try:
@@ -1524,7 +1525,7 @@ def export_stills(proj, tl, markers, all_markers, path, filenames):
                     clip_info['render_name'] = job['OutputFilename']
 
     # Return to Deliver page so user can see the populated render queue
-    if itm["render_all_tracks"].Checked:
+    if _render_context.get('render_all_tracks', itm["render_all_tracks"].Checked):
         try:
             resolve.OpenPage("deliver")
             print("Switched back to Deliver page.")
@@ -1550,22 +1551,42 @@ def _main(ev):
     Args:
         ev: The event object triggering this function.
     """
-    global _cancel_render
+    global _cancel_render, _render_context
     _cancel_render = False
+
+    # ── Snapshot ALL UI state on the main thread ──────────────────────────
+    # Resolve API and UI elements are not safe to access from a background
+    # thread, so we read everything here and pass it to the worker.
+    _render_context = {
+        'render_all_tracks':  itm["render_all_tracks"].Checked,
+        'use_preset_naming':  itm["use_preset_naming"].Checked,
+        'create_folders':     itm["create_folders"].Checked,
+        'video_track':        itm["video_track"].CurrentText,
+        'render_preset':      itm["render_preset"].CurrentText,
+    }
+    tl_name = itm["tl_preset"].CurrentText
+    path    = itm["export_path"].CurrentText
+
+    # ── Main-thread Resolve calls (API must run on the main thread) ───────
+    try:
+        pm   = resolve.GetProjectManager()
+        proj = pm.GetCurrentProject()
+        tl   = proj.GetTimelineByIndex(tl_idx(proj, tl_name))
+        markers, all_markers = get_markers(tl)
+        filename_map = get_filenames(markers, all_markers)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        update_status(f"Export error: {str(e)}")
+        print(f"Export error: {str(e)}")
+        return
+
     itm["Export"].Enabled = False
     itm["StopRender"].Enabled = True
 
-    # Snapshot UI values on the main thread before handing off
-    tl_name = itm["tl_preset"].CurrentText
-    path = itm["export_path"].CurrentText
-
+    # ── Background thread: only the blocking render loop ──────────────────
     def _run():
         try:
-            pm = resolve.GetProjectManager()
-            proj = pm.GetCurrentProject()
-            tl = proj.GetTimelineByIndex(tl_idx(proj, tl_name))
-            markers, all_markers = get_markers(tl)
-            filename_map = get_filenames(markers, all_markers)
             export_stills(proj, tl, markers, all_markers, path, filename_map)
         except Exception as e:
             import traceback
